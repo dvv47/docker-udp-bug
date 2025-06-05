@@ -423,7 +423,6 @@ start_tcp_server() {
         --tcp-port "$TCP_PORT" \
         --udp-host "$HOST_IP" \
         --udp-port "$UDP_PORT" \
-        --log-file "$LOG_DIR/tcp_server.log" \
         >> "$LOG_DIR/tcp_server.log" 2>&1 &
     TCP_SERVER_PID=$!
     
