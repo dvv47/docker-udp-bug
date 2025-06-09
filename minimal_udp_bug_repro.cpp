@@ -1,16 +1,13 @@
-// Docker UDP Bug Reproduction Test Case
-// Minimal reproduction of Docker UDP forwarding bug caused by socket destruction order
+// Docker UDP Forwarding Instability Reproduction
+// Demonstrates Docker UDP forwarding failure with burst traffic patterns
 //
-// ROOT CAUSE: Docker bridge gets corrupted when UDP sockets are destroyed BEFORE TCP sockets
-// The shutdown() vs close() pattern is less important than the destruction order!
+// CRITICAL FINDING: Docker UDP forwarding becomes unstable with burst UDP traffic
+// patterns EVEN when using proper socket destruction order (TCP first, then UDP).
+// This suggests a fundamental issue with Docker's UDP forwarding mechanism
+// when handling realistic burst traffic scenarios.
 //
-// REPRODUCTION:
-// 1. Create UDP server + successful TCP connection to HOST machine (through Docker bridge)
-// 2. Destroy UDP socket FIRST (even with proper shutdown+close)
-// 3. This corrupts Docker bridge, breaking UDP forwarding on next run
-//
-// SETUP: Run a TCP server on HOST machine first:
-//   nc -l -p 11002   (or any TCP server on port 11002)
+// SETUP: Python TCP/UDP server on HOST sends burst UDP traffic to container:
+//   python3 tcp_udp_server.py --udp-host <container_ip>
 
 #include <iostream>
 #include <thread>
@@ -30,14 +27,13 @@
 #include <netdb.h>
 
 namespace {
-    constexpr uint16_t UDP_PORT = 54603;  // Reverted back to original port
+    constexpr uint16_t UDP_PORT = 54603;
     constexpr uint16_t TCP_PORT = 11002;
-    constexpr const char* HOST_IP = "host.docker.internal";  // Docker's host IP
+    constexpr const char* HOST_IP = "host.docker.internal";
 }
 
 struct TestConfig {
-    bool manual_cleanup = false;
-    int runtime_seconds = 2;
+    int runtime_seconds = 15;
     std::string log_file_path = "";
     std::string tcp_host = HOST_IP;
 };
@@ -49,11 +45,9 @@ private:
     std::atomic<bool> running{false};
     std::atomic<int> messages_received{0};
     std::string log_file_path;
-    bool manual_cleanup_mode;
     
 public:
-    UdpServer(const std::string& log_path, bool manual_mode) 
-        : log_file_path(log_path), manual_cleanup_mode(manual_mode) {}
+    UdpServer(const std::string& log_path) : log_file_path(log_path) {}
     
     ~UdpServer() {
         properCleanup();
@@ -91,7 +85,7 @@ public:
         
         running = true;
         worker_thread = std::thread([this]() {
-            std::cout << "[UDP] Worker thread started" << std::endl;
+            std::cout << "[UDP] Worker thread started - ready to receive burst traffic" << std::endl;
             
             char buffer[1024];
             struct sockaddr_in client_addr;
@@ -110,7 +104,7 @@ public:
                     buffer[received] = '\0';
                     messages_received++;
                     
-                    std::cout << "[UDP] Received: '" << buffer << "'" << std::endl;
+                    std::cout << "[UDP] Received: '" << buffer << "' (total: " << messages_received << ")" << std::endl;
                     
                     // Log to file for verification
                     std::ofstream log_file(log_file_path, std::ios::app);
@@ -126,7 +120,7 @@ public:
                 }
             }
             
-            std::cout << "[UDP] Worker thread ended" << std::endl;
+            std::cout << "[UDP] Worker thread ended. Total messages received: " << messages_received << std::endl;
         });
         
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -134,7 +128,7 @@ public:
     }
     
     void properCleanup() {
-        std::cout << "[UDP] === PROPER CLEANUP ===" << std::endl;
+        std::cout << "[UDP] === PROPER CLEANUP SEQUENCE ===" << std::endl;
         
         if (running.exchange(false)) {
             if (worker_thread.joinable()) {
@@ -143,11 +137,17 @@ public:
         }
         
         if (socket_fd != -1) {
-            std::cout << "[UDP] shutdown() + close()" << std::endl;
-            shutdown(socket_fd, SHUT_RDWR);  // PROPER: shutdown first
+            std::cout << "[UDP] Using proper shutdown() + close() sequence" << std::endl;
+            shutdown(socket_fd, SHUT_RDWR);
             close(socket_fd);
             socket_fd = -1;
         }
+        
+        std::cout << "[UDP] Final message count: " << messages_received << std::endl;
+    }
+    
+    int getMessageCount() const {
+        return messages_received;
     }
 };
 
@@ -156,20 +156,18 @@ private:
     int socket_fd = -1;
     std::string ip;
     uint16_t port;
-    bool manual_cleanup_mode;
     bool connected = false;
     
 public:
-    TcpClient(const std::string& ip_, uint16_t port_, bool manual_mode) 
-        : ip(ip_), port(port_), manual_cleanup_mode(manual_mode) {}
+    TcpClient(const std::string& ip_, uint16_t port_) : ip(ip_), port(port_) {}
     
     ~TcpClient() {
         properCleanup();
     }
     
     bool connect() {
-        std::cout << "[TCP_CLIENT] Attempting to connect to " << ip << ":" << port << std::endl;
-        std::cout << "[TCP_CLIENT] This connection goes through Docker bridge - critical for bug reproduction!" << std::endl;
+        std::cout << "[TCP_CLIENT] Connecting to " << ip << ":" << port << std::endl;
+        std::cout << "[TCP_CLIENT] This triggers Python server to send burst UDP traffic" << std::endl;
         
         socket_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd < 0) {
@@ -182,7 +180,7 @@ public:
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
         
-        // Try to resolve hostname using getaddrinfo
+        // Resolve hostname
         struct addrinfo hints, *result;
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_INET;
@@ -190,13 +188,12 @@ public:
         
         int status = getaddrinfo(ip.c_str(), nullptr, &hints, &result);
         if (status != 0) {
-            std::cerr << "[TCP_CLIENT] ✗ Failed to resolve hostname '" << ip << "': " << gai_strerror(status) << std::endl;
+            std::cerr << "[TCP_CLIENT] Failed to resolve '" << ip << "': " << gai_strerror(status) << std::endl;
             close(socket_fd);
             socket_fd = -1;
             return false;
         }
         
-        // Use the first result
         struct sockaddr_in* addr_in = (struct sockaddr_in*)result->ai_addr;
         addr.sin_addr = addr_in->sin_addr;
         
@@ -206,16 +203,13 @@ public:
         
         freeaddrinfo(result);
         
-        // Connect to host machine through Docker bridge
         if (::connect(socket_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
             connected = true;
-            std::cout << "[TCP_CLIENT] ✓ Successfully connected to " << ip << " (" << ip_str << "):" << port << std::endl;
-            std::cout << "[TCP_CLIENT] ✓ Docker bridge connection established!" << std::endl;
+            std::cout << "[TCP_CLIENT] ✓ Connected! Python server will now send burst UDP traffic" << std::endl;
             return true;
         } else {
-            std::cerr << "[TCP_CLIENT] ✗ Connection failed to " << ip << " (" << ip_str << "):" << port << ": " << strerror(errno) << std::endl;
-            std::cerr << "[TCP_CLIENT] ✗ Make sure TCP server is running on host machine:" << std::endl;
-            std::cerr << "[TCP_CLIENT] ✗   nc -l -k -p " << port << "   (on host machine)" << std::endl;
+            std::cerr << "[TCP_CLIENT] Connection failed: " << strerror(errno) << std::endl;
+            std::cerr << "[TCP_CLIENT] Ensure Python TCP/UDP server is running on host" << std::endl;
             close(socket_fd);
             socket_fd = -1;
             return false;
@@ -228,7 +222,8 @@ public:
     
     void properCleanup() {
         if (socket_fd != -1) {
-            std::cout << "[TCP_CLIENT] shutdown() + close()" << std::endl;
+            std::cout << "[TCP_CLIENT] === PROPER CLEANUP SEQUENCE ===" << std::endl;
+            std::cout << "[TCP_CLIENT] Using proper shutdown() + close() sequence" << std::endl;
             if (connected) {
                 shutdown(socket_fd, SHUT_RDWR);
             }
@@ -245,9 +240,7 @@ TestConfig parseArgs(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         std::string arg(argv[i]);
         
-        if (arg == "--manual-cleanup") {
-            config.manual_cleanup = true;
-        } else if (arg == "--runtime" && i + 1 < argc) {
+        if (arg == "--runtime" && i + 1 < argc) {
             config.runtime_seconds = std::atoi(argv[i + 1]);
             i++;
         } else if (arg == "--log-file" && i + 1 < argc) {
@@ -272,71 +265,71 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    std::cout << "=== Docker UDP Bug Reproduction ===" << std::endl;
-    std::cout << "Mode: " << (config.manual_cleanup ? "PROPER" : "BUGGY") << " destruction order" << std::endl;
+    std::cout << "=== Docker UDP Burst Traffic Instability Test ===" << std::endl;
+    std::cout << "Purpose: Demonstrate Docker UDP forwarding instability with burst patterns" << std::endl;
     std::cout << "Runtime: " << config.runtime_seconds << "s" << std::endl;
     std::cout << "TCP Host: " << config.tcp_host << ":" << TCP_PORT << std::endl;
-    std::cout << "\nIMPORTANT: Start TCP server on HOST machine first:" << std::endl;
-    std::cout << "  nc -l -k -p " << TCP_PORT << "   (recommended)" << std::endl;
-    std::cout << "  or: nc -l -p " << TCP_PORT << "   (single connection)" << std::endl;
+    std::cout << "\nCRITICAL: This test uses PROPER socket destruction order (TCP first, UDP second)" << std::endl;
+    std::cout << "Yet Docker UDP forwarding may still fail due to burst traffic patterns!\n" << std::endl;
     
     try {
-        // Create UDP server
-        auto udp_server = std::make_unique<UdpServer>(config.log_file_path, config.manual_cleanup);
+        // Create UDP server first
+        auto udp_server = std::make_unique<UdpServer>(config.log_file_path);
         if (!udp_server->start()) {
             std::cerr << "Failed to start UDP server" << std::endl;
             return 1;
         }
         
-        // Create TCP client and connect to HOST machine (through Docker bridge)
-        std::unique_ptr<TcpClient> tcp_client = std::make_unique<TcpClient>(config.tcp_host, TCP_PORT, config.manual_cleanup);
+        // Connect to host - this triggers burst UDP traffic from Python server
+        auto tcp_client = std::make_unique<TcpClient>(config.tcp_host, TCP_PORT);
         if (!tcp_client->connect()) {
-            std::cerr << "Failed to establish TCP connection to host machine" << std::endl;
-            std::cerr << "This connection is REQUIRED for bug reproduction!" << std::endl;
+            std::cerr << "Failed to connect to Python TCP/UDP server" << std::endl;
+            std::cerr << "Start it with: python3 tcp_udp_server.py --udp-host <container_ip>" << std::endl;
             return 1;
         }
         
-        // Verify successful connection
         if (!tcp_client->isConnected()) {
             std::cerr << "TCP connection not established" << std::endl;
             return 1;
         }
         
-        std::cout << "\n=== Running for " << config.runtime_seconds << "s ===" << std::endl;
-        std::cout << "✓ TCP connection to host established (through Docker bridge)" << std::endl;
-        std::cout << "✓ UDP server listening on port " << UDP_PORT << std::endl;
-        std::cout << "Test UDP with: echo 'TEST' | nc -u localhost " << UDP_PORT << std::endl;
+        std::cout << "\n=== Running Test (Receiving Burst UDP Traffic) ===" << std::endl;
+        std::cout << "✓ TCP connection established - Python server sending burst UDP traffic" << std::endl;
+        std::cout << "✓ UDP server ready to receive burst patterns (10 msgs + 5s pause)" << std::endl;
+        std::cout << "✓ Monitoring Docker UDP forwarding stability..." << std::endl;
         
+        // Let the test run and collect burst UDP traffic
         std::this_thread::sleep_for(std::chrono::seconds(config.runtime_seconds));
         
-        std::cout << "\n=== Cleanup Phase ===" << std::endl;
+        std::cout << "\n=== Cleanup Phase (PROPER Socket Destruction Order) ===" << std::endl;
+        std::cout << "Using PROPER destruction sequence: TCP first, then UDP" << std::endl;
+        std::cout << "This should work, but Docker may have been destabilized by burst traffic" << std::endl;
         
-        if (config.manual_cleanup) {
-            // PROPER: Clean up in correct order (TCP first, then UDP)
-            std::cout << "PROPER ORDER: TCP first, then UDP" << std::endl;
-            tcp_client->properCleanup();
-            udp_server->properCleanup();
+        // ALWAYS use proper cleanup order - TCP first, then UDP
+        tcp_client->properCleanup();
+        tcp_client.reset();
+        
+        udp_server->properCleanup();
+        int final_count = udp_server->getMessageCount();
+        udp_server.reset();
+        
+        std::cout << "\n=== Test Results ===" << std::endl;
+        std::cout << "Socket destruction order: PROPER (TCP → UDP)" << std::endl;
+        std::cout << "Total UDP messages received: " << final_count << std::endl;
+        
+        if (final_count > 0) {
+            std::cout << "✓ Some UDP messages received - partial success" << std::endl;
         } else {
-            // BUGGY: Force UDP destruction BEFORE TCP destruction
-            // This is the key factor that corrupts Docker bridge (regardless of cleanup method)
-            std::cout << "BUGGY ORDER: Forcing UDP destruction FIRST" << std::endl;
-            std::cout << "This will corrupt Docker bridge even with proper shutdown+close!" << std::endl;
-            udp_server.reset();  // Force UDP destruction before TCP
-            // tcp_client will be destroyed automatically at end of scope
+            std::cout << "✗ No UDP messages received - Docker UDP forwarding failed" << std::endl;
         }
+        
+        std::cout << "\nIMPORTANT: If this test fails repeatedly, it demonstrates that" << std::endl;
+        std::cout << "Docker UDP forwarding is unstable with burst traffic patterns," << std::endl;
+        std::cout << "even when applications use proper socket cleanup procedures." << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Exception: " << e.what() << std::endl;
         return 1;
-    }
-    
-    if (config.manual_cleanup) {
-        std::cout << "\n=== PROPER DESTRUCTION ORDER COMPLETED ===" << std::endl;
-        std::cout << "TCP destroyed first, then UDP - Docker bridge should remain healthy" << std::endl;
-    } else {
-        std::cout << "\n=== BUGGY DESTRUCTION ORDER COMPLETED ===" << std::endl;
-        std::cout << "UDP destroyed first - Docker bridge is likely corrupted!" << std::endl;
-        std::cout << "Next run may fail to receive UDP packets" << std::endl;
     }
     
     return 0;

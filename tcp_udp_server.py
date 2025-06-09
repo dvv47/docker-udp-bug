@@ -43,15 +43,15 @@ class ClientHandler:
         counter = 1
         try:
             while self.running:
-                udp_message = f"Hello World UDP {counter}"
-                try:
-                    self.udp_socket.sendto(udp_message.encode('utf-8'), (self.udp_host, self.udp_port))
-                    print(f"UDP message {counter} sent to {self.udp_host}:{self.udp_port}")
-                except socket.error as e:
-                    print(f"UDP send failed: {e}")
-                
-                counter += 1
-                time.sleep(0.1)
+                for i in range(10):
+                    udp_message = f"Hello World UDP {counter}"
+                    try:
+                        self.udp_socket.sendto(udp_message.encode('utf-8'), (self.udp_host, self.udp_port))
+                        print(f"UDP message {counter} sent to {self.udp_host}:{self.udp_port}")
+                    except socket.error as e:
+                        print(f"UDP send failed: {e}")
+                    counter += 1
+                time.sleep(5.0)
                 
         except Exception as e:
             if self.running:
@@ -93,7 +93,7 @@ class TCPUDPServer:
                 try:
                     client_socket, client_address = self.tcp_socket.accept()
                     
-                    # self._stop_current_client()
+                    self._stop_current_client()
                     
                     self.current_client_handler = ClientHandler(
                         client_socket, 
